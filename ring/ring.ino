@@ -26,6 +26,7 @@ const int RX_LED_PIN    = 13;   // built-in LED to indicate RX for calibration
 // Set to true to run in simple calibration mode: print sensor output and
 // let the button turn the RX LED on. Disable to restore normal transceiver.
 const bool CALIBRATE_MODE = true;
+const int ANALOG_RX_PIN = A0;   // optional analog read of sensor for thresholding
 // RX wait timeout — prevents blocking Serial input forever
 const uint32_t RX_WAIT_TIMEOUT_US = 3000000UL;  // 3s max wait for edge
 
@@ -237,8 +238,10 @@ void loop() {
       lastMs = millis();
       bool filtered;
       int raw = debugReadSensor(filtered);
+      int analogVal = analogRead(ANALOG_RX_PIN);
       Serial.print("SENSOR raw="); Serial.print(raw);
-      Serial.print(" filtered="); Serial.println(filtered ? 1 : 0);
+      Serial.print(" filtered="); Serial.print(filtered ? 1 : 0);
+      Serial.print(" analog="); Serial.println(analogVal);
     }
     // Skip normal transceiver behavior while in calibration mode
     return;

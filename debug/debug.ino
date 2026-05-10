@@ -1,58 +1,51 @@
-// === DEBUG SENSOR: Lectura del fotodetector + control manual del laser ===
-// Usa el boton en D2 (INPUT_PULLUP) para encender el laser en D8.
-// Muestra en Serial las lecturas del sensor para identificar
-// el umbral entre luz ambiente (dia) y laser directo.
+// === DEBUG SENSOR: Nivel de luz crudo del LDR ===
+// Muestra la lectura analogica del pin S del modulo LDR (pin 10).
+// Boton en D2 enciende el laser en D8 para comparar luz ambiente vs laser.
+//
+// NOTA: El sensor tiene logica invertida —
+//   mucha luz = valor bajo (~0),   poca luz = valor alto (~1023).
+//   El laser deberia hacer caer el valor al iluminar el sensor.
 //
 // Pines:
-//   D2  = Boton (a GND, usa pull-up interno)
-//   D7  = Fotodetector / modulo LDR (DO — salida digital)
+//   D2  = Boton (a GND, pull-up interno)
 //   D8  = Laser
-//   D10 = Sensor pin S (senal cruda del LDR)
+//   D10 = Pin S del LDR (senal analogica de nivel de luz)
 //
-// Serial: 115200 baud — lecturas rapidas sin saturar el monitor.
+// Serial: 115200 baud
 
-const int RX_PIN    = 7;
 const int TX_PIN    = 8;
 const int BTN_PIN   = 2;
-const int SENSOR_S  = 10;   // pin S del modulo LDR (senal cruda)
+const int SENSOR_S  = 10;
 
 void setup() {
-  pinMode(RX_PIN, INPUT);
   pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, LOW);
   pinMode(BTN_PIN, INPUT_PULLUP);
-  pinMode(SENSOR_S, INPUT);
 
   Serial.begin(115200);
   Serial.println(F("=== DEBUG SENSOR ==="));
-  Serial.println(F("D7=DO(D), D10=S(analog), D8=laser, D2=boton"));
-  Serial.println(F("Presiona el boton para encender el laser."));
-  Serial.println(F("Observa el cambio en los valores para hallar el umbral.\n"));
-  Serial.println(F("S_ana\tfiltD7\tlaserON"));
-  Serial.println(F("-----\t------\t-------"));
+  Serial.println(F("Lectura analogica del pin S (D10) del LDR."));
+  Serial.println(F("Boton D2 -> enciende laser D8."));
+  Serial.println(F("Sensor invertido: luz=bajo, oscuridad=alto.\n"));
+  Serial.println(F("luz\tlaser"));
+  Serial.println(F("---\t-----"));
 }
 
 void loop() {
-  // Leer boton (LOW = presionado, por INPUT_PULLUP)
   bool laserON = (digitalRead(BTN_PIN) == LOW);
   digitalWrite(TX_PIN, laserON ? HIGH : LOW);
 
-  // Leer pin S crudo del LDR (analogico)
-  int sRaw = analogRead(SENSOR_S);
-
-  // Muestrear el sensor digital (DO): 20 lecturas rapidas para filtro por mayoria
-  int highCount = 0;
-  for (int i = 0; i < 20; i++) {
-    if (digitalRead(RX_PIN) == HIGH) highCount++;
+  // Promedio de 8 lecturas para suavizar ruido
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(SENSOR_S);
+    delayMicroseconds(200);
   }
+  int luz = sum / 8;
 
-  // S_ana: lectura analogica cruda (0-1023)
-  // filtD7: cuantas de 20 muestras del DO fueron HIGH
-  Serial.print(sRaw);
-  Serial.print(F("\t"));
-  Serial.print(highCount);
+  Serial.print(luz);
   Serial.print(F("\t"));
   Serial.println(laserON ? F("SI") : F("NO"));
 
-  delay(100);  // ~10 lecturas/seg, suficiente para ver cambios
+  delay(50);
 }

@@ -20,6 +20,12 @@ const uint32_t START_HIGH_MIN_US = 500000UL;   // minimum valid start HIGH
 // Photodetector logic inversion (adjust based on sensor)
 const bool INVERTED_LOGIC = true;
 
+// --- Calibration / debug pins ---
+const int BUTTON_PIN    = 2;    // on-board or external button (uses INPUT_PULLUP)
+const int RX_LED_PIN    = 13;   // built-in LED to indicate RX for calibration
+// Set to true to run in simple calibration mode: print sensor output and
+// let the button turn the RX LED on. Disable to restore normal transceiver.
+const bool CALIBRATE_MODE = true;
 // RX wait timeout — prevents blocking Serial input forever
 const uint32_t RX_WAIT_TIMEOUT_US = 3000000UL;  // 3s max wait for edge
 
@@ -96,6 +102,19 @@ bool readSignalFiltered() {
     if (raw) highCount++;
   }
   return highCount > 10;
+}
+
+// Debug helper: return raw high count and filtered boolean
+int debugReadSensor(bool &filtered) {
+  int highCount = 0;
+  for (int i = 0; i < 20; i++) {
+    bool raw = digitalRead(RX_PIN);
+    if (INVERTED_LOGIC) raw = !raw;
+    if (raw) highCount++;
+    delayMicroseconds(50);
+  }
+  filtered = highCount > 10;
+  return highCount;
 }
 
 // waitEdge with timeout — returns true if edge found, false on timeout
@@ -200,11 +219,31 @@ void setup() {
   pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, LOW);
   pinMode(RX_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RX_LED_PIN, OUTPUT);
   Serial.begin(9600);
   Serial.println("TRANSCEPTOR Listo. Escribe mensaje (TX) o espera laser (RX)...");
 }
 
 void loop() {
+  if (CALIBRATE_MODE) {
+    // Calibration/debug mode: print raw sensor output periodically
+    static unsigned long lastMs = 0;
+    // Button pressed -> force RX LED on for visual calibration
+    bool btnPressed = digitalRead(BUTTON_PIN) == LOW;
+    digitalWrite(RX_LED_PIN, btnPressed ? HIGH : LOW);
+
+    if (millis() - lastMs >= 200) {
+      lastMs = millis();
+      bool filtered;
+      int raw = debugReadSensor(filtered);
+      Serial.print("SENSOR raw="); Serial.print(raw);
+      Serial.print(" filtered="); Serial.println(filtered ? 1 : 0);
+    }
+    // Skip normal transceiver behavior while in calibration mode
+    return;
+  }
+
   // 1. Always handle serial input first (non-blocking)
   handleSerialInput();
 

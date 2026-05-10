@@ -105,16 +105,14 @@ bool readSignalFiltered() {
   return highCount > 10;
 }
 
-// Debug helper: return raw high count and filtered boolean
-int debugReadSensor(bool &filtered) {
+// Debug helper: return raw high-count (no filtering/inversion)
+int debugReadSensorRaw() {
   int highCount = 0;
   for (int i = 0; i < 20; i++) {
     bool raw = digitalRead(RX_PIN);
-    if (INVERTED_LOGIC) raw = !raw;
     if (raw) highCount++;
     delayMicroseconds(50);
   }
-  filtered = highCount > 10;
   return highCount;
 }
 
@@ -217,13 +215,16 @@ void handleSerialInput() {
 // ==================== SETUP / LOOP ====================
 
 void setup() {
-  pinMode(TX_PIN, OUTPUT);
-  digitalWrite(TX_PIN, LOW);
+  if (!CALIBRATE_MODE) {
+    pinMode(TX_PIN, OUTPUT);
+    digitalWrite(TX_PIN, LOW);
+  }
   pinMode(RX_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(RX_LED_PIN, OUTPUT);
   Serial.begin(9600);
-  Serial.println("TRANSCEPTOR Listo. Escribe mensaje (TX) o espera laser (RX)...");
+  if (CALIBRATE_MODE) Serial.println("CALIBRATE: raw sensor read only (no TX/filters)");
+  else Serial.println("TRANSCEPTOR Listo. Escribe mensaje (TX) o espera laser (RX)...");
 }
 
 void loop() {
@@ -236,11 +237,9 @@ void loop() {
 
     if (millis() - lastMs >= 200) {
       lastMs = millis();
-      bool filtered;
-      int raw = debugReadSensor(filtered);
+      int rawCount = debugReadSensorRaw();
       int analogVal = analogRead(ANALOG_RX_PIN);
-      Serial.print("SENSOR raw="); Serial.print(raw);
-      Serial.print(" filtered="); Serial.print(filtered ? 1 : 0);
+      Serial.print("SENSOR rawCount="); Serial.print(rawCount);
       Serial.print(" analog="); Serial.println(analogVal);
     }
     // Skip normal transceiver behavior while in calibration mode

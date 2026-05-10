@@ -1,198 +1,229 @@
-// === RFC-UNA-2026-PULSE: TRANSCEPTOR (TX+RX) - SINGLE BOARD ===
-// Combines transmitter and receiver on one Arduino.
-// D8 = laser output, D7 = photodetector input.
+// ==================================================================
+//   TRANSCEPTOR — PULSE (TX) + ULNET 4-bit (RX) — Single Arduino
+// ==================================================================
+// Sends in RFC-UNA-2026-PULSE format, receives in RFC-UNA-2026-ULNET XA
+// format with 4-bit source/destination addresses.
+//
+// Hardware:
+//   D2  = Boton (a GND, INPUT_PULLUP) — opcional, para debug
+//   D8  = Laser / LED (TX)
+//   A0  = Pin S del modulo LDR (sensor analogico de luz)
+//   D13 = LED integrado (indicador RX, opcional)
+//
+// Umbral de luz: analogRead ≤ 75 → luz detectada (1), > 75 → oscuridad (0)
 
-// -------------------- Hardware Configuration --------------------
-const int TX_PIN        = 8;
-const int RX_PIN        = 7;
-const uint8_t XOR_KEY   = 0x42;
-const uint8_t MY_ID     = 0x1;
-const uint8_t DEST_ID   = 0x2;
+// -------------------- Hardware --------------------
+const int TX_PIN       = 8;
+const int RX_ANALOG    = A0;
+const int BTN_PIN      = 2;
+const int LED_PIN      = 13;
 
-// -------------------- Timing Constants --------------------
-const uint32_t BIT_HALF_US       = 200000UL;   // 200ms half-bit
-const uint32_t START_HIGH_US     = 800000UL;   // 800ms start pulse HIGH
-const uint32_t START_OFF_US      = 200000UL;   // 200ms start pulse LOW
-const uint32_t END_GUARD_US      = 500000UL;   // 500ms end guard
-const uint32_t CENTER_OFFSET_US  = 100000UL;   // sample center offset
-const uint32_t START_HIGH_MIN_US = 500000UL;   // minimum valid start HIGH
+// -------------------- Nuestro ID --------------------
+const uint8_t MY_ID    = 0x1;
 
-// Photodetector logic inversion (adjust based on sensor)
-const bool INVERTED_LOGIC = true;
+// ==================== PROTOCOLO PULSE (TX — rfc.md) ====================
+// Manchester, 50 ms/bit = 25 ms half-bit
+const uint32_t PULSE_HALF_US   =  25000UL;
+const uint32_t PULSE_START_HI  = 150000UL;  // 150 ms HIGH
+const uint32_t PULSE_START_LO  =  50000UL;  //  50 ms LOW
+const uint32_t PULSE_END_GUARD = 100000UL;  // 100 ms LOW after frame
+const uint8_t  PULSE_PREAMBLE  = 0xAA;
+const uint8_t  PULSE_FOOTER    = 0x55;
+const uint8_t  PULSE_XOR_KEY   = 0x42;
 
-// --- Calibration / debug pins ---
-const int BUTTON_PIN    = 2;    // on-board or external button (uses INPUT_PULLUP)
-const int RX_LED_PIN    = 13;   // built-in LED to indicate RX for calibration
-// Set to true to run in simple calibration mode: print sensor output and
-// let the button turn the RX LED on. Disable to restore normal transceiver.
-const bool CALIBRATE_MODE = true;
-const int ANALOG_RX_PIN = A0;   // optional analog read of sensor for thresholding
-// RX wait timeout — prevents blocking Serial input forever
-const uint32_t RX_WAIT_TIMEOUT_US = 3000000UL;  // 3s max wait for edge
+// ==================== PROTOCOLO ULNET (RX — rfc-that-we-recieve.md) ====================
+// Simple on/off, 100 ms/bit, direcciones de 4 bits
+const uint32_t ULNET_BIT_US    = 100000UL;  // 100 ms
+const uint16_t ULNET_THRESHOLD = 75;        // analog ≤ 75 = luz
+const uint8_t  ULNET_PREAMBLE  = 0xFE;      // 11111110
+const uint8_t  ULNET_XOR_KEY   = 0x5A;
+const uint8_t  ULNET_BROADCAST = 0x0F;      // broadcast address
 
-// -------------------- TX State --------------------
-char     msgBuffer[17];
-int      msgLen   = 0;
-uint8_t  seqNum   = 0;
-bool     txBusy   = false;   // guard: skip RX checks while transmitting
+// Tiempo entre tramas ULNET (el emisor manda 400 ms LOW)
+const uint32_t ULNET_GAP_US    = 400000UL;
 
-// -------------------- Shared Timing Helper --------------------
+// Maximo de espera para borde de subida sin quedarnos bloqueados
+const uint32_t EDGE_TIMEOUT_US = 5000000UL;  // 5 s
+
+// -------------------- Estado TX (PULSE) --------------------
+char    msgBuffer[17];
+int     msgLen  = 0;
+uint8_t seqNum  = 0;
+bool    txBusy  = false;
+
+// -------------------- Utilidad compartida --------------------
 void waitUntil(uint32_t target) {
   while ((long)(micros() - target) < 0);
 }
 
-// ==================== TRANSMITTER FUNCTIONS ====================
+// ==================== TX: PULSE (Manchester) ====================
 
 void sendHalf(bool level, uint32_t& t_next) {
   digitalWrite(TX_PIN, level ? HIGH : LOW);
-  t_next += BIT_HALF_US;
+  t_next += PULSE_HALF_US;
   waitUntil(t_next);
 }
 
 void sendManchesterBit(bool val, uint32_t& t_next) {
-  sendHalf(val,  t_next);   // Manchester: 1 = H→L, 0 = L→H
+  sendHalf( val, t_next);   // 1 = H→L, 0 = L→H
   sendHalf(!val, t_next);
 }
 
-void sendByteManchester(uint8_t b, uint32_t& t_next) {
-  for (int i = 7; i >= 0; i--) sendManchesterBit(bitRead(b, i), t_next);
+// Envia n bits Manchester MSB-first (n ≤ 8)
+void sendManchesterBits(uint8_t val, uint8_t n, uint32_t& t_next) {
+  for (int i = n - 1; i >= 0; i--)
+    sendManchesterBit(bitRead(val, i), t_next);
 }
 
-void sendFrame(uint8_t id_o, uint8_t id_d, uint8_t seq, const char* msg) {
+// Frame PULSE completo segun rfc.md
+void sendFrame_PULSE(uint8_t id_orig, uint8_t id_dest, uint8_t seq,
+                     const char* msg) {
   uint8_t len = strlen(msg);
   uint8_t payload[16];
-  uint8_t chk = id_o ^ id_d ^ seq ^ len;
+  uint8_t chk = id_orig ^ id_dest ^ seq ^ len;
 
   for (int i = 0; i < len; i++) {
-    payload[i] = msg[i] ^ XOR_KEY;
+    payload[i] = msg[i] ^ PULSE_XOR_KEY;
     chk ^= payload[i];
   }
 
+  digitalWrite(LED_PIN, HIGH);  // indicador visual
+
   uint32_t t_next = micros();
 
-  // Start condition: HIGH then LOW
+  // Start pulse: HIGH 150ms, LOW 50ms
   digitalWrite(TX_PIN, HIGH);
-  t_next += START_HIGH_US;
+  t_next += PULSE_START_HI;
   waitUntil(t_next);
-
   digitalWrite(TX_PIN, LOW);
-  t_next += START_OFF_US;
+  t_next += PULSE_START_LO;
   waitUntil(t_next);
 
-  // Frame body
-  sendByteManchester(0xAA, t_next);                              // preamble
-  sendByteManchester((id_o << 4) | id_d, t_next);                // IDs
-  sendByteManchester((seq << 4) | len, t_next);                  // seq + length
-  for (int i = 0; i < len; i++) sendByteManchester(payload[i], t_next);
-  sendByteManchester(chk, t_next);                               // checksum
-  sendByteManchester(0x55, t_next);                              // footer
+  // Cuerpo de la trama PULSE
+  sendManchesterBits(PULSE_PREAMBLE, 8, t_next);   // 0xAA
+  sendManchesterBits(id_orig,         4, t_next);   // origen
+  sendManchesterBits(id_dest,         4, t_next);   // destino
+  sendManchesterBits(seq,             4, t_next);   // secuencia
+  sendManchesterBits(len,             8, t_next);   // longitud
+  for (int i = 0; i < len; i++)
+    sendManchesterBits(payload[i],    8, t_next);   // payload cifrado
+  sendManchesterBits(chk,             8, t_next);   // checksum
+  sendManchesterBits(PULSE_FOOTER,    8, t_next);   // 0x55
 
   // End guard
   digitalWrite(TX_PIN, LOW);
-  t_next += END_GUARD_US;
+  t_next += PULSE_END_GUARD;
   waitUntil(t_next);
+
+  digitalWrite(LED_PIN, LOW);
 }
 
-// ==================== RECEIVER FUNCTIONS ====================
+// ==================== RX: ULNET (on/off simple) ====================
 
-bool readSignalFiltered() {
-  int highCount = 0;
-  for (int i = 0; i < 20; i++) {
-    bool raw = digitalRead(RX_PIN);
-    if (INVERTED_LOGIC) raw = !raw;
-    if (raw) highCount++;
+// Lee el sensor analogico y devuelve true si hay luz (≤ umbral)
+bool readLight() {
+  // Promedio de 3 lecturas para filtrar ruido
+  long sum = 0;
+  for (int i = 0; i < 3; i++) {
+    sum += analogRead(RX_ANALOG);
+    delayMicroseconds(200);
   }
-  return highCount > 10;
+  return (sum / 3) <= ULNET_THRESHOLD;
 }
 
-// Debug helper: return raw high-count (no filtering/inversion)
-int debugReadSensorRaw() {
-  int highCount = 0;
-  for (int i = 0; i < 20; i++) {
-    bool raw = digitalRead(RX_PIN);
-    if (raw) highCount++;
-    delayMicroseconds(50);
-  }
-  return highCount;
-}
-
-// waitEdge with timeout — returns true if edge found, false on timeout
-bool waitEdgeStable(bool level, uint32_t& t_edge) {
+// Espera un borde de subida (transicion oscuridad→luz).
+// Devuelve true y guarda t0 si lo encuentra antes del timeout.
+bool waitRisingEdge(uint32_t& t0) {
   uint32_t start = micros();
-  while (readSignalFiltered() != level) {
-    if ((long)(micros() - start) >= (long)RX_WAIT_TIMEOUT_US) return false;
+  // Primero esperar a que este oscuro (por si ya hay luz residual)
+  while (readLight()) {
+    if ((long)(micros() - start) >= (long)EDGE_TIMEOUT_US) return false;
   }
-  t_edge = micros();
+  // Ahora esperar el borde de subida
+  while (!readLight()) {
+    if ((long)(micros() - start) >= (long)EDGE_TIMEOUT_US) return false;
+  }
+  t0 = micros();
   return true;
 }
 
-bool sampleHalfBit(uint32_t t0, uint8_t index) {
-  uint32_t center = t0 + START_OFF_US + CENTER_OFFSET_US + ((uint32_t)index * BIT_HALF_US);
-  waitUntil(center - 10000);  // 10ms before center
-
-  int accum = 0;
-  for (int i = 0; i < 15; i++) {
-    if (readSignalFiltered()) accum++;
-    delayMicroseconds(500);
-  }
-  return accum > 7;
+// Formatea una trama ULNET recibida para mostrarla en Serial
+void printULNETFrame(uint8_t dest, uint8_t orig, uint8_t dato, uint8_t chk) {
+  Serial.print(F("[ULNET] Dest:0x")); Serial.print(dest, HEX);
+  Serial.print(F(" Orig:0x"));         Serial.print(orig, HEX);
+  Serial.print(F(" Data:0x"));         Serial.print(dato, HEX);
+  Serial.print(F(" Chk:0x"));          Serial.print(chk, HEX);
 }
 
-uint8_t readByteManchester(uint32_t t0, uint8_t &idx) {
-  uint8_t b = 0;
-  for (int i = 7; i >= 0; i--) {
-    bool f = sampleHalfBit(t0, idx++);
-    bool s = sampleHalfBit(t0, idx++);
-    if (f && !s)      bitSet(b, i);
-    else if (!f && s) bitClear(b, i);
-  }
-  return b;
-}
-
-// ==================== RX FRAME DECODER ====================
-
-void receiveFrame() {
-  uint32_t tHigh;
-  if (!waitEdgeStable(true, tHigh)) return;
-
+// Recibe y decodifica una trama ULNET.
+// Retorna true si la trama fue valida y procesada.
+// El puntero relay se activa si la trama no es para nosotros
+// y debemos reenviarla en formato PULSE.
+bool receiveFrame_ULNET() {
+  // Esperar borde de subida
   uint32_t t0;
-  if (!waitEdgeStable(false, t0)) return;
+  if (!waitRisingEdge(t0)) return false;
 
-  if ((t0 - tHigh) < START_HIGH_MIN_US) return;
-
-  uint8_t idx = 0;
-  uint8_t preamble = readByteManchester(t0, idx);
-  if (preamble != 0xAA) return;
-
-  uint8_t ids = readByteManchester(t0, idx);
-  uint8_t sl  = readByteManchester(t0, idx);
-  uint8_t len = sl & 0x0F;
-
-  if (len == 0 || len > 16) return;
-
-  uint8_t payload[16];
-  for (int i = 0; i < len; i++) payload[i] = readByteManchester(t0, idx);
-  uint8_t rxChk = readByteManchester(t0, idx);
-  uint8_t fin   = readByteManchester(t0, idx);
-
-  uint8_t calc = ((ids >> 4) & 0x0F) ^ (ids & 0x0F) ^ ((sl >> 4) & 0x0F) ^ len;
-  for (int i = 0; i < len; i++) calc ^= payload[i];
-
-  if (calc == rxChk && fin == 0x55) {
-    Serial.print("[RX] ");
-    for (int i = 0; i < len; i++) Serial.write(payload[i] ^ XOR_KEY);
-    Serial.println();
-  } else {
-    Serial.print("[RX:FALLO] Calc:0x"); Serial.print(calc, HEX);
-    Serial.print(" RxChk:0x"); Serial.print(rxChk, HEX);
-    Serial.print(" Fin:0x"); Serial.print(fin, HEX);
-    Serial.print(" Payload:");
-    for (int i = 0; i < len; i++) { Serial.print(" "); Serial.print(payload[i], HEX); }
-    Serial.println();
+  // Leer 31 bits, muestreando en el centro de cada periodo (100ms)
+  // Sample[i] en t0 + 50ms + i*100ms, i=0..30
+  uint32_t frame = 0;  // max 31 bits, cabe en uint32_t
+  for (uint8_t i = 0; i < 31; i++) {
+    uint32_t t_sample = t0 + 50000UL + ((uint32_t)i * ULNET_BIT_US);
+    waitUntil(t_sample);
+    if (readLight())
+      frame |= ((uint32_t)1 << (30 - i));  // MSB primero → pos 30 es el 1er bit
   }
+
+  // Extraer campos (MSB-first dentro del frame de 31 bits)
+  uint8_t preamble = (frame >> 23) & 0xFF;  // bits 30..23
+  if (preamble != ULNET_PREAMBLE) return false;
+
+  uint8_t dest    = (frame >> 19) & 0x0F;   // bits 22..19
+  uint8_t orig    = (frame >> 15) & 0x0F;   // bits 18..15
+  uint8_t len     = (frame >> 10) & 0x1F;   // bits 14..10
+  uint8_t data    = (frame >>  5) & 0x1F;   // bits  9..5
+  uint8_t chk     = (frame >>  0) & 0x1F;   // bits  4..0
+
+  // Verificar checksum (en ULNET chk == data cifrada)
+  if (chk != data) {
+    Serial.print(F("[RX:ULNET] Checksum fail — "));
+    printULNETFrame(dest, orig, data, chk);
+    Serial.println();
+    return false;
+  }
+
+  // Descifrar dato
+  uint8_t decrypted = data ^ ULNET_XOR_KEY;
+  char ascii = 'a' + (decrypted & 0x1F);
+
+  // ¿Es para nosotros?
+  if (dest == MY_ID || dest == ULNET_BROADCAST) {
+    Serial.print(F("[RX:OK] "));
+    printULNETFrame(dest, orig, data, chk);
+    Serial.print(F(" -> '"));
+    Serial.print(ascii);
+    Serial.println(F("'"));
+    return true;
+  }
+
+  // No es para nosotros → reenviar en formato PULSE
+  Serial.print(F("[RX:RELAY] "));
+  printULNETFrame(dest, orig, data, chk);
+  Serial.print(F(" -> reenviando '"));
+  Serial.print(ascii);
+  Serial.println(F("'"));
+
+  // Empaquetar en trama PULSE y enviar (ID origen/destino preservados)
+  char payload[2] = { ascii, '\0' };
+  txBusy = true;
+  sendFrame_PULSE(orig, dest, seqNum++ & 0x0F, payload);
+  txBusy = false;
+
+  Serial.println(F("[TX:RELAY] Trama PULSE reenviada."));
+  return true;
 }
 
-// ==================== TX MESSAGE HANDLER ====================
+// ==================== Manejo de entrada Serial ====================
 
 void handleSerialInput() {
   if (!Serial.available()) return;
@@ -201,57 +232,65 @@ void handleSerialInput() {
   if (c == '\n' || c == '\r') {
     if (msgLen > 0) {
       msgBuffer[msgLen] = '\0';
+
+      uint8_t dest;
+      if (msgBuffer[0] == '@') {
+        // Formato: @X mensaje  — destino especificado
+        dest = msgBuffer[1] - '0';
+        if (dest > 9) dest = msgBuffer[1] - 'A' + 10;
+        if (dest > 15) dest = 0x02;  // default
+        // Quitar "@X" del mensaje
+        for (int i = 0; i <= msgLen - 3; i++)
+          msgBuffer[i] = msgBuffer[i + 2];
+        msgLen -= 2;
+        msgBuffer[msgLen] = '\0';
+      } else {
+        dest = 0x02;  // destino por defecto
+      }
+
       txBusy = true;
-      sendFrame(MY_ID, DEST_ID, seqNum++ & 0x0F, msgBuffer);
+      sendFrame_PULSE(MY_ID, dest & 0x0F, seqNum++ & 0x0F, msgBuffer);
       txBusy = false;
       msgLen = 0;
-      Serial.println("[TX] Enviado.");
+
+      Serial.print(F("[TX:PULSE] Enviado a 0x"));
+      Serial.println(dest & 0x0F, HEX);
     }
   } else if (msgLen < 16 && c >= 32) {
     msgBuffer[msgLen++] = c;
   }
 }
 
-// ==================== SETUP / LOOP ====================
+// ==================== Setup / Loop ====================
 
 void setup() {
-  if (!CALIBRATE_MODE) {
-    pinMode(TX_PIN, OUTPUT);
-    digitalWrite(TX_PIN, LOW);
-  }
-  pinMode(RX_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RX_LED_PIN, OUTPUT);
+  pinMode(TX_PIN, OUTPUT);
+  digitalWrite(TX_PIN, LOW);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   Serial.begin(9600);
-  if (CALIBRATE_MODE) Serial.println("CALIBRATE: raw sensor read only (no TX/filters)");
-  else Serial.println("TRANSCEPTOR Listo. Escribe mensaje (TX) o espera laser (RX)...");
+  Serial.println(F("======================================"));
+  Serial.println(F(" TRANSCEPTOR — PULSE(TX) + ULNET(RX)"));
+  Serial.print  (F(" Mi ID: 0x")); Serial.println(MY_ID, HEX);
+  Serial.println(F(" TX: PULSE (Manchester, 50ms/bit)"));
+  Serial.println(F(" RX: ULNET (100ms/bit, umbral=75)"));
+  Serial.println(F(" Escribe mensaje o espera laser..."));
+  Serial.println(F(" Destino: @X al inicio del mensaje"));
+  Serial.println(F("   ej: \"@3 hola\" envia a nodo 3"));
+  Serial.println(F("======================================"));
 }
 
 void loop() {
-  if (CALIBRATE_MODE) {
-    // Calibration/debug mode: print raw sensor output periodically
-    static unsigned long lastMs = 0;
-    // Button pressed -> force RX LED on for visual calibration
-    bool btnPressed = digitalRead(BUTTON_PIN) == LOW;
-    digitalWrite(RX_LED_PIN, btnPressed ? HIGH : LOW);
-
-    if (millis() - lastMs >= 200) {
-      lastMs = millis();
-      int rawCount = debugReadSensorRaw();
-      int analogVal = analogRead(ANALOG_RX_PIN);
-      Serial.print("SENSOR rawCount="); Serial.print(rawCount);
-      Serial.print(" analog="); Serial.println(analogVal);
-    }
-    // Skip normal transceiver behavior while in calibration mode
-    return;
-  }
-
-  // 1. Always handle serial input first (non-blocking)
+  // 1. Procesar entrada serial (no bloqueante)
   handleSerialInput();
 
-  // 2. If not transmitting, listen for incoming frames
-  //    (receiveFrame returns quickly when no signal via timeouts)
+  // 2. Si no estamos transmitiendo, escuchar tramas ULNET
   if (!txBusy) {
-    receiveFrame();
+    receiveFrame_ULNET();
+
+    // Pequeña pausa para no saturar el ADC
+    delay(1);
   }
 }

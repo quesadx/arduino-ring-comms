@@ -11,18 +11,18 @@
 //   D8  = Laser
 //   D10 = Pin S del LDR (senal analogica de nivel de luz)
 //
-// Serial: 115200 baud
+// Serial: 9600 baud (changed for compatibility with other sketches)
 
 const int TX_PIN    = 8;
 const int BTN_PIN   = 2;
-const int SENSOR_S  = 10;
+const int SENSOR_S  = A0; // use analog pin A0 for light sensor
 
 void setup() {
   pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, LOW);
   pinMode(BTN_PIN, INPUT_PULLUP);
 
-  Serial.begin(115200);
+  Serial.begin(9600);
   Serial.println(F("=== DEBUG SENSOR ==="));
   Serial.println(F("Lectura analogica del pin S (D10) del LDR."));
   Serial.println(F("Boton D2 -> enciende laser D8."));
@@ -43,9 +43,12 @@ void loop() {
   }
   int luz = sum / 8;
 
-  Serial.print(luz);
-  Serial.print(F("\t"));
+  // Print clear numeric value and laser state on separate lines
+  Serial.print(F("luz="));
+  Serial.println(luz);
+  Serial.print(F("laser="));
   Serial.println(laserON ? F("SI") : F("NO"));
+  Serial.println(); // blank line to separate samples for easy reading
 
   delay(50);
 }

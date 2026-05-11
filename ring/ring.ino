@@ -1,16 +1,10 @@
 // ==================================================================
-//   TRANSCEPTOR — PULSE (TX) + ULNET 4-bit (RX) — Single Arduino
+//   TRANSCEPTOR — PULSE (TX) + Steven (RX) — Single Arduino
 // ==================================================================
-// Sends in RFC-UNA-2026-PULSE format, receives in RFC-UNA-2026-ULNET XA
-// format with 4-bit source/destination addresses.
+// TX: RFC-UNA-2026-PULSE (rfc.md) — Manchester, 50ms/bit, XOR 0x42
+// RX: Steven protocol — pulse-width, 100/300ms bits, XOR 0x5A
 //
-// Hardware:
-//   D2  = Boton (a GND, INPUT_PULLUP) — opcional, para debug
-//   D8  = Laser / LED (TX)
-//   A0  = Pin S del modulo LDR (sensor analogico de luz)
-//   D13 = LED integrado (indicador RX, opcional)
-//
-// Umbral de luz: analogRead ≤ 75 → luz detectada (1), > 75 → oscuridad (0)
+// Hardware: D8=laser, A0=sensor LDR, D2=boton, D13=LED
 
 // -------------------- Hardware --------------------
 const int TX_PIN       = 8;
@@ -21,29 +15,40 @@ const int LED_PIN      = 13;
 // -------------------- Nuestro ID --------------------
 const uint8_t MY_ID    = 0x1;
 
+// -------------------- Umbral de luz (del debug: ≤75 = laser) --------------------
+const uint16_t LIGHT_THRESHOLD = 75;
+
 // ==================== PROTOCOLO PULSE (TX — rfc.md) ====================
-// Manchester, 50 ms/bit = 25 ms half-bit
 const uint32_t PULSE_HALF_US   =  25000UL;
-const uint32_t PULSE_START_HI  = 150000UL;  // 150 ms HIGH
-const uint32_t PULSE_START_LO  =  50000UL;  //  50 ms LOW
-const uint32_t PULSE_END_GUARD = 100000UL;  // 100 ms LOW after frame
+const uint32_t PULSE_START_HI  = 150000UL;
+const uint32_t PULSE_START_LO  =  50000UL;
+const uint32_t PULSE_END_GUARD = 100000UL;
 const uint8_t  PULSE_PREAMBLE  = 0xAA;
 const uint8_t  PULSE_FOOTER    = 0x55;
 const uint8_t  PULSE_XOR_KEY   = 0x42;
 
-// ==================== PROTOCOLO ULNET (RX — rfc-that-we-recieve.md) ====================
-// Simple on/off, 100 ms/bit, direcciones de 4 bits
-const uint32_t ULNET_BIT_US    = 100000UL;  // 100 ms
-const uint16_t ULNET_THRESHOLD = 75;        // analog ≤ 75 = luz
-const uint8_t  ULNET_PREAMBLE  = 0xFE;      // 11111110
-const uint8_t  ULNET_XOR_KEY   = 0x5A;
-const uint8_t  ULNET_BROADCAST = 0x0F;      // broadcast address
+// ==================== PROTOCOLO Steven (RX) ====================
+// Steven encoding: START=500ms, bit0=100ms, bit1=300ms, FIN=700ms
+// Each pulse followed by 100ms LOW pause
+const uint32_t STEVEN_THR_FIN   = 600000UL;  // >600ms → FIN
+const uint32_t STEVEN_THR_START = 400000UL;  // >400ms → START
+const uint32_t STEVEN_THR_BIT1  = 200000UL;  // >200ms → bit 1
+// ≤200ms → bit 0
 
-// Tiempo entre tramas ULNET (el emisor manda 400 ms LOW)
-const uint32_t ULNET_GAP_US    = 400000UL;
+const uint8_t STEVEN_XOR_KEY   = 0x5A;
 
-// Maximo de espera para borde de subida sin quedarnos bloqueados
-const uint32_t EDGE_TIMEOUT_US = 500000UL;   // 500 ms
+// Timeout for edge detection per loop cycle
+const uint32_t EDGE_TIMEOUT_US  = 500000UL;  // 500ms
+
+// Message accumulation timeout (ms)
+const uint16_t MSG_TIMEOUT_MS   = 3000;
+
+// Steven pulse classification
+#define PULSE_BIT0   0
+#define PULSE_BIT1   1
+#define PULSE_START  2
+#define PULSE_FIN    3
+#define PULSE_TIMEOUT 4
 
 // -------------------- Estado TX (PULSE) --------------------
 char    msgBuffer[17];
@@ -51,9 +56,35 @@ int     msgLen  = 0;
 uint8_t seqNum  = 0;
 bool    txBusy  = false;
 
+// -------------------- Buffer de tramas Steven recibidas --------------------
+const uint8_t MAX_TRAMAS = 64;
+
+struct TramaRx {
+  char    caracter;
+  uint8_t destino;
+  uint8_t origen;
+};
+
+TramaRx  tramasRx[MAX_TRAMAS];
+uint8_t  tramasLen          = 0;
+uint32_t ultimaTramaMs      = 0;
+bool     hayTramasPendientes = false;
+
 // -------------------- Utilidad compartida --------------------
 void waitUntil(uint32_t target) {
   while ((long)(micros() - target) < 0);
+}
+
+// ==================== LECTURA DEL SENSOR ====================
+
+// Retorna true si hay luz (analog ≤ umbral)
+bool readLight() {
+  long sum = 0;
+  for (int i = 0; i < 3; i++) {
+    sum += analogRead(RX_ANALOG);
+    delayMicroseconds(200);
+  }
+  return (sum / 3) <= LIGHT_THRESHOLD;
 }
 
 // ==================== TX: PULSE (Manchester) ====================
@@ -65,17 +96,15 @@ void sendHalf(bool level, uint32_t& t_next) {
 }
 
 void sendManchesterBit(bool val, uint32_t& t_next) {
-  sendHalf( val, t_next);   // 1 = H→L, 0 = L→H
+  sendHalf( val, t_next);
   sendHalf(!val, t_next);
 }
 
-// Envia n bits Manchester MSB-first (n ≤ 8)
 void sendManchesterBits(uint8_t val, uint8_t n, uint32_t& t_next) {
   for (int i = n - 1; i >= 0; i--)
     sendManchesterBit(bitRead(val, i), t_next);
 }
 
-// Frame PULSE completo segun rfc.md
 void sendFrame_PULSE(uint8_t id_orig, uint8_t id_dest, uint8_t seq,
                      const char* msg) {
   uint8_t len = strlen(msg);
@@ -87,7 +116,7 @@ void sendFrame_PULSE(uint8_t id_orig, uint8_t id_dest, uint8_t seq,
     chk ^= payload[i];
   }
 
-  digitalWrite(LED_PIN, HIGH);  // indicador visual
+  digitalWrite(LED_PIN, HIGH);
 
   uint32_t t_next = micros();
 
@@ -99,16 +128,16 @@ void sendFrame_PULSE(uint8_t id_orig, uint8_t id_dest, uint8_t seq,
   t_next += PULSE_START_LO;
   waitUntil(t_next);
 
-  // Cuerpo de la trama PULSE
-  sendManchesterBits(PULSE_PREAMBLE, 8, t_next);   // 0xAA
-  sendManchesterBits(id_orig,         4, t_next);   // origen
-  sendManchesterBits(id_dest,         4, t_next);   // destino
-  sendManchesterBits(seq,             4, t_next);   // secuencia
-  sendManchesterBits(len,             8, t_next);   // longitud
+  // Frame body
+  sendManchesterBits(PULSE_PREAMBLE, 8, t_next);
+  sendManchesterBits(id_orig,         4, t_next);
+  sendManchesterBits(id_dest,         4, t_next);
+  sendManchesterBits(seq,             4, t_next);
+  sendManchesterBits(len,             8, t_next);
   for (int i = 0; i < len; i++)
-    sendManchesterBits(payload[i],    8, t_next);   // payload cifrado
-  sendManchesterBits(chk,             8, t_next);   // checksum
-  sendManchesterBits(PULSE_FOOTER,    8, t_next);   // 0x55
+    sendManchesterBits(payload[i], 8, t_next);
+  sendManchesterBits(chk,             8, t_next);
+  sendManchesterBits(PULSE_FOOTER,    8, t_next);
 
   // End guard
   digitalWrite(TX_PIN, LOW);
@@ -118,109 +147,141 @@ void sendFrame_PULSE(uint8_t id_orig, uint8_t id_dest, uint8_t seq,
   digitalWrite(LED_PIN, LOW);
 }
 
-// ==================== RX: ULNET (on/off simple) ====================
+// ==================== RX: Steven (pulse-width) ====================
 
-// Lee el sensor analogico y devuelve true si hay luz (≤ umbral)
-bool readLight() {
-  // Promedio de 3 lecturas para filtrar ruido
-  long sum = 0;
-  for (int i = 0; i < 3; i++) {
-    sum += analogRead(RX_ANALOG);
-    delayMicroseconds(200);
-  }
-  return (sum / 3) <= ULNET_THRESHOLD;
-}
-
-// Espera un borde de subida (transicion oscuridad→luz).
-// Devuelve true y guarda t0 si lo encuentra antes del timeout.
-bool waitRisingEdge(uint32_t& t0) {
-  uint32_t start = micros();
-  // Primero esperar a que este oscuro (por si ya hay luz residual)
+// Lee un pulso Steven midiendo la duracion en HIGH.
+// Retorna PULSE_BIT0, PULSE_BIT1, PULSE_START, PULSE_FIN, o PULSE_TIMEOUT.
+uint8_t readStevenPulse() {
+  // Esperar oscuridad (por si venimos de un pulso anterior)
+  uint32_t t0 = micros();
   while (readLight()) {
-    if ((long)(micros() - start) >= (long)EDGE_TIMEOUT_US) return false;
+    if ((long)(micros() - t0) >= (long)EDGE_TIMEOUT_US) return PULSE_TIMEOUT;
   }
-  // Ahora esperar el borde de subida
-  while (!readLight()) {
-    if ((long)(micros() - start) >= (long)EDGE_TIMEOUT_US) return false;
-  }
-  t0 = micros();
-  return true;
-}
 
-// Formatea una trama ULNET recibida para mostrarla en Serial
-void printULNETFrame(uint8_t dest, uint8_t orig, uint8_t dato, uint8_t chk) {
-  Serial.print(F("[ULNET] Dest:0x")); Serial.print(dest, HEX);
-  Serial.print(F(" Orig:0x"));         Serial.print(orig, HEX);
-  Serial.print(F(" Data:0x"));         Serial.print(dato, HEX);
-  Serial.print(F(" Chk:0x"));          Serial.print(chk, HEX);
-}
-
-// Recibe y decodifica una trama ULNET.
-// Retorna true si la trama fue valida y procesada.
-// El puntero relay se activa si la trama no es para nosotros
-// y debemos reenviarla en formato PULSE.
-bool receiveFrame_ULNET() {
   // Esperar borde de subida
-  uint32_t t0;
-  if (!waitRisingEdge(t0)) return false;
-
-  // Leer 31 bits, muestreando en el centro de cada periodo (100ms)
-  // Sample[i] en t0 + 50ms + i*100ms, i=0..30
-  uint32_t frame = 0;  // max 31 bits, cabe en uint32_t
-  for (uint8_t i = 0; i < 31; i++) {
-    uint32_t t_sample = t0 + 50000UL + ((uint32_t)i * ULNET_BIT_US);
-    waitUntil(t_sample);
-    if (readLight())
-      frame |= ((uint32_t)1 << (30 - i));  // MSB primero → pos 30 es el 1er bit
+  while (!readLight()) {
+    if ((long)(micros() - t0) >= (long)EDGE_TIMEOUT_US) return PULSE_TIMEOUT;
   }
 
-  // Extraer campos (MSB-first dentro del frame de 31 bits)
-  uint8_t preamble = (frame >> 23) & 0xFF;  // bits 30..23
-  if (preamble != ULNET_PREAMBLE) return false;
+  // Medir cuanto dura en HIGH
+  uint32_t t_rise = micros();
+  while (readLight()) {
+    if ((long)(micros() - t_rise) >= 1000000L) break;  // 1s safety
+  }
+  uint32_t duration = micros() - t_rise;
 
-  uint8_t dest    = (frame >> 19) & 0x0F;   // bits 22..19
-  uint8_t orig    = (frame >> 15) & 0x0F;   // bits 18..15
-  uint8_t len     = (frame >> 10) & 0x1F;   // bits 14..10
-  uint8_t data    = (frame >>  5) & 0x1F;   // bits  9..5
-  uint8_t chk     = (frame >>  0) & 0x1F;   // bits  4..0
+  if (duration > STEVEN_THR_FIN)   return PULSE_FIN;    // >600ms → FIN (700)
+  if (duration > STEVEN_THR_START) return PULSE_START;  // >400ms → START (500)
+  if (duration > STEVEN_THR_BIT1)  return PULSE_BIT1;   // >200ms → bit 1 (300)
+  return PULSE_BIT0;                                    // else  → bit 0 (100)
+}
 
-  // Verificar checksum (en ULNET chk == data cifrada)
-  if (chk != data) {
-    Serial.print(F("[RX:ULNET] Checksum fail — "));
-    printULNETFrame(dest, orig, data, chk);
-    Serial.println();
-    return false;
+// Recibe una trama Steven completa y la acumula.
+// Formato: START [4b dest][4b orig][5b len][5b data][5b chk] FIN
+void receiveFrame_Steven() {
+  // Esperar START
+  uint8_t pulse = readStevenPulse();
+  if (pulse != PULSE_START) return;
+
+  // Leer 23 bits del cuerpo (4+4+5+5+5)
+  uint32_t raw = 0;
+  for (int i = 0; i < 23; i++) {
+    pulse = readStevenPulse();
+    if (pulse == PULSE_TIMEOUT) return;
+    if (pulse != PULSE_BIT0 && pulse != PULSE_BIT1) return;
+    raw = (raw << 1) | (pulse & 1);
   }
 
-  // Descifrar dato
-  uint8_t decrypted = data ^ ULNET_XOR_KEY;
-  char ascii = 'a' + (decrypted & 0x1F);
+  // Consumir FIN (debe venir, pero ya tenemos los datos)
+  pulse = readStevenPulse();
+  // Si no es FIN, igual procesamos lo que tenemos
 
-  // ¿Es para nosotros?
-  if (dest == MY_ID || dest == ULNET_BROADCAST) {
-    Serial.print(F("[RX:OK] "));
-    printULNETFrame(dest, orig, data, chk);
-    Serial.print(F(" -> '"));
-    Serial.print(ascii);
-    Serial.println(F("'"));
-    return true;
+  // Extraer campos (MSB first)
+  uint8_t dest = (raw >> 19) & 0x0F;
+  uint8_t orig = (raw >> 15) & 0x0F;
+  uint8_t len  = (raw >> 10) & 0x1F;
+  uint8_t data = (raw >>  5) & 0x1F;
+  uint8_t chk  = (raw >>  0) & 0x1F;
+
+  // Validar
+  if (len == 0 || len > 16) return;
+  if (chk != data) {  // Steven: checksum == data cifrada
+    Serial.print(F("[RX:Stev] Chk fail. Calc:"));
+    Serial.print(data, HEX);
+    Serial.print(F(" Rx:"));
+    Serial.println(chk, HEX);
+    return;
   }
 
-  // No es para nosotros → reenviar en formato PULSE
-  Serial.print(F("[RX:RELAY] "));
-  printULNETFrame(dest, orig, data, chk);
-  Serial.print(F(" -> reenviando '"));
-  Serial.print(ascii);
-  Serial.println(F("'"));
+  // Descifrar: 5-bit → ASCII (a=0..z=25)
+  uint8_t decrypted = data ^ STEVEN_XOR_KEY;
+  char c = 'a' + (decrypted & 0x1F);
 
-  // Empaquetar en trama PULSE y enviar (ID origen/destino preservados)
-  char payload[2] = { ascii, '\0' };
-  txBusy = true;
-  sendFrame_PULSE(orig, dest, seqNum++ & 0x0F, payload);
-  txBusy = false;
+  // Acumular
+  if (tramasLen < MAX_TRAMAS) {
+    tramasRx[tramasLen].caracter = c;
+    tramasRx[tramasLen].destino  = dest;
+    tramasRx[tramasLen].origen   = orig;
+    tramasLen++;
+  }
 
-  Serial.println(F("[TX:RELAY] Trama PULSE reenviada."));
-  return true;
+  ultimaTramaMs       = millis();
+  hayTramasPendientes = true;
+
+  Serial.print(F("[RX:Stev] dest:0x")); Serial.print(dest, HEX);
+  Serial.print(F(" orig:0x"));          Serial.print(orig, HEX);
+  Serial.print(F(" '"));
+  if (c >= 'a' && c <= 'z') Serial.print(c); else Serial.print('?');
+  Serial.print(F("' ("));
+  Serial.print(tramasLen);
+  Serial.println(F(" tramas acum.)"));
+}
+
+// Procesa el mensaje completo acumulado
+void procesarMensajeCompleto() {
+  if (tramasLen == 0) {
+    hayTramasPendientes = false;
+    return;
+  }
+
+  uint8_t destino = tramasRx[0].destino;
+  uint8_t origen  = tramasRx[0].origen;
+
+  Serial.println(F("=============================="));
+  Serial.print(F("[MSG] ")); Serial.print(tramasLen);
+  Serial.print(F(" tramas. Dest:0x")); Serial.print(destino, HEX);
+  Serial.print(F(" Orig:0x")); Serial.println(origen, HEX);
+
+  if (destino == MY_ID || destino == 0x0F) {
+    // Es para nosotros
+    Serial.print(F("[MSG:PARA_MI] \""));
+    for (uint8_t i = 0; i < tramasLen; i++) {
+      char cc = tramasRx[i].caracter;
+      if (cc >= 'a' && cc <= 'z') Serial.print(cc);
+    }
+    Serial.println(F("\""));
+  } else {
+    // No es para nosotros → reenviar en PULSE
+    Serial.println(F("[MSG:RELAY] Reenviando en PULSE..."));
+
+    char relayBuf[17];
+    uint8_t n = tramasLen;
+    if (n > 16) n = 16;
+    for (uint8_t i = 0; i < n; i++)
+      relayBuf[i] = tramasRx[i].caracter;
+    relayBuf[n] = '\0';
+
+    txBusy = true;
+    sendFrame_PULSE(origen, destino, seqNum++ & 0x0F, relayBuf);
+    txBusy = false;
+
+    Serial.print(F("[TX:RELAY] ")); Serial.print(n);
+    Serial.println(F(" chars en trama PULSE."));
+  }
+  Serial.println(F("=============================="));
+
+  tramasLen            = 0;
+  hayTramasPendientes  = false;
 }
 
 // ==================== Manejo de entrada Serial ====================
@@ -234,18 +295,16 @@ void handleSerialInput() {
       msgBuffer[msgLen] = '\0';
 
       uint8_t dest;
-      if (msgBuffer[0] == '@') {
-        // Formato: @X mensaje  — destino especificado
+      if (msgBuffer[0] == '@' && msgLen >= 2) {
         dest = msgBuffer[1] - '0';
         if (dest > 9) dest = msgBuffer[1] - 'A' + 10;
-        if (dest > 15) dest = 0x02;  // default
-        // Quitar "@X" del mensaje
+        if (dest > 15) dest = 0x02;
         for (int i = 0; i <= msgLen - 3; i++)
           msgBuffer[i] = msgBuffer[i + 2];
         msgLen -= 2;
         msgBuffer[msgLen] = '\0';
       } else {
-        dest = 0x02;  // destino por defecto
+        dest = 0x02;
       }
 
       txBusy = true;
@@ -272,13 +331,11 @@ void setup() {
 
   Serial.begin(9600);
   Serial.println(F("======================================"));
-  Serial.println(F(" TRANSCEPTOR — PULSE(TX) + ULNET(RX)"));
+  Serial.println(F(" TRANSCEPTOR — PULSE(TX) + Steven(RX)"));
   Serial.print  (F(" Mi ID: 0x")); Serial.println(MY_ID, HEX);
-  Serial.println(F(" TX: PULSE (Manchester, 50ms/bit)"));
-  Serial.println(F(" RX: ULNET (100ms/bit, umbral=75)"));
-  Serial.println(F(" Escribe mensaje o espera laser..."));
-  Serial.println(F(" Destino: @X al inicio del mensaje"));
-  Serial.println(F("   ej: \"@3 hola\" envia a nodo 3"));
+  Serial.println(F(" TX: PULSE (Manchester, 50ms/bit, XOR 0x42)"));
+  Serial.println(F(" RX: Steven (pulse-width, XOR 0x5A, umbral=75)"));
+  Serial.println(F(" @X msg → destino X. Escuchando..."));
   Serial.println(F("======================================"));
 }
 
@@ -286,11 +343,13 @@ void loop() {
   // 1. Procesar entrada serial (no bloqueante)
   handleSerialInput();
 
-  // 2. Si no estamos transmitiendo, escuchar tramas ULNET
-  if (!txBusy) {
-    receiveFrame_ULNET();
+  // 2. Verificar timeout: procesar mensaje completo acumulado
+  if (hayTramasPendientes && (millis() - ultimaTramaMs > MSG_TIMEOUT_MS)) {
+    procesarMensajeCompleto();
+  }
 
-    // Pequeña pausa para no saturar el ADC
-    delay(1);
+  // 3. Si no estamos transmitiendo, intentar recibir trama Steven
+  if (!txBusy) {
+    receiveFrame_Steven();
   }
 }

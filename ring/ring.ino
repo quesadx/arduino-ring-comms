@@ -43,7 +43,7 @@ const uint8_t  ULNET_BROADCAST = 0x0F;      // broadcast address
 const uint32_t ULNET_GAP_US    = 400000UL;
 
 // Maximo de espera para borde de subida sin quedarnos bloqueados
-const uint32_t EDGE_TIMEOUT_US = 5000000UL;  // 5 s
+const uint32_t EDGE_TIMEOUT_US = 500000UL;   // 500 ms
 
 // -------------------- Estado TX (PULSE) --------------------
 char    msgBuffer[17];
